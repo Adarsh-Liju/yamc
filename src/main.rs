@@ -6,7 +6,21 @@ use std::io::Write;
 fn markdown_convert(str: &String) {
     let path = str;
     let markdown = fs::read_to_string(path).expect("Should be able to read the file");
-    let html = comrak::markdown_to_html(&markdown, &comrak::ComrakOptions::default());
+    // convert markdown to html using comrak even table is supported
+    let options = comrak::ComrakOptions {
+        extension: comrak::ComrakExtensionOptions {
+            strikethrough: true,
+            tagfilter: true,
+            table: true,
+            autolink: true,
+            tasklist: true,
+            superscript: true,
+            header_ids: Some("".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let html = comrak::markdown_to_html(&markdown,&options);
     let mut file = fs::File::create("output.html").expect("Unable to create file");
     file.write_all(html.as_bytes()).expect("Unable to write data");
     add_css_to_html();
@@ -39,6 +53,7 @@ fn main() {
     if args[1] == "convert" {
         markdown_convert(&args[2]);
     } else {
+
         println!("The Flag is not correct")
     }
 }
