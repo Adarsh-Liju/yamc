@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use comrak::{markdown_to_html, ComrakOptions, ComrakExtensionOptions};
+use printpdf::*;
+use std::io::BufWriter;
 
 #[derive(Debug)]
 enum OutputFormat {
@@ -221,45 +223,120 @@ fn convert_html_to_pdf(html_file: &Path, pdf_file: &Path) -> Result<(), Conversi
     Ok(())
 }
 
+// Add a new function for pure Rust PDF export
+fn convert_markdown_to_pdf(markdown: &str, pdf_path: &Path) -> Result<(), ConversionError> {
+    use comrak::{parse_document, Arena, ComrakOptions, nodes::{AstNode, NodeValue}};
+    use printpdf::{PdfDocument, Mm, Pt, PdfLayerReference};
+
+    let arena = Arena::new();
+    let options = create_comrak_options();
+    let root = parse_document(&arena, markdown, &options);
+
+    let (doc, page1, layer1) = PdfDocument::new("Markdown PDF", Mm(210.0), Mm(297.0), "Layer 1");
+    let current_layer = doc.get_page(page1).get_layer(layer1);
+
+    let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
+    let mut y = Mm(287.0); // Start near top of A4
+
+    render_node_to_pdf(&root, &current_layer, &font, &mut y)?;
+
+    let mut file = BufWriter::new(fs::File::create(pdf_path)?);
+    doc.save(&mut file).map_err(|e| ConversionError::PdfConversionFailed(format!("PDF save error: {e}")))?;
+    Ok(())
+}
+
+// Recursively render AST nodes to PDF
+fn render_node_to_pdf<'a>(
+    node: &'a AstNode<'a>,
+    layer: &PdfLayerReference,
+    font: &IndirectFontRef,
+    y: &mut Mm,
+) -> Result<(), ConversionError> {
+    use comrak::nodes::NodeValue::*;
+    for child in node.children() {
+        match &child.data.borrow().value {
+            Heading(h) => {
+                let text = collect_text(child);
+                let size = match h.level {
+                    1 => 24.0,
+                    2 => 20.0,
+                    3 => 16.0,
+                    _ => 14.0,
+                };
+                *y -= Mm(size * 0.7);
+                layer.use_text(text, size, Mm(20.0), *y, font);
+                *y -= Mm(4.0);
+            }
+            Paragraph => {
+                let text = collect_text(child);
+                *y -= Mm(10.0);
+                layer.use_text(text, 12.0, Mm(20.0), *y, font);
+                *y -= Mm(4.0);
+            }
+            List(_) => {
+                for item in child.children() {
+                    if let Item = item.data.borrow().value {
+                        let text = collect_text(item);
+                        *y -= Mm(8.0);
+                        layer.use_text(format!("• {}", text), 12.0, Mm(25.0), *y, font);
+                        *y -= Mm(2.0);
+                    }
+                }
+            }
+            Text(t) => {
+                // handled in collect_text
+            }
+            Emph | Strong | Code | HtmlInline(_) | SoftBreak | LineBreak | CodeBlock(_) | ThematicBreak | BlockQuote | HtmlBlock(_) | FootnoteDefinition(_) | Table(_) | TableRow | TableCell | TaskItem { .. } | DescriptionList | DescriptionItem(_) | DescriptionTerm | DescriptionDetails => {
+                // Not implemented for brevity
+            }
+            _ => {}
+        }
+        render_node_to_pdf(child, layer, font, y)?;
+    }
+    Ok(())
+}
+
+// Helper to collect text from a node
+fn collect_text<'a>(node: &'a AstNode<'a>) -> String {
+    use comrak::nodes::NodeValue::*;
+    let mut text = String::new();
+    for child in node.children() {
+        match &child.data.borrow().value {
+            Text(t) => text.push_str(&String::from_utf8_lossy(t)),
+            Code(t) => text.push_str(&String::from_utf8_lossy(t)),
+            Emph | Strong => text.push_str(&collect_text(child)),
+            SoftBreak | LineBreak => text.push(' '),
+            _ => text.push_str(&collect_text(child)),
+        }
+    }
+    text
+}
+
+// Update convert_markdown_file to use the new PDF function
 fn convert_markdown_file(config: &Config) -> Result<(), ConversionError> {
     let format_str = match config.output_format {
         OutputFormat::Html => "HTML",
         OutputFormat::Pdf => "PDF",
     };
-    
-    println!("Converting '{}' to {}...", 
-             config.input_file.display(), 
-             format_str);
-    
-    // Read markdown content
+
+    println!("Converting '{}' to {}...", config.input_file.display(), format_str);
+
     let markdown_content = read_markdown_file(&config.input_file)?;
-    
-    // Convert to HTML
-    let html_content = convert_markdown_to_html(&markdown_content)?;
-    
+
     match config.output_format {
         OutputFormat::Html => {
-            // Create complete HTML document
+            let html_content = convert_markdown_to_html(&markdown_content)?;
             let full_html = create_html_document(&html_content, &config.css_url, &config.css_class);
             write_html_file(&config.output_file, &full_html)?;
         }
         OutputFormat::Pdf => {
-            // Create temporary HTML file
-            let temp_html = config.output_file.with_extension("temp.html");
-            let full_html = create_html_document(&html_content, &config.css_url, &config.css_class);
-            write_html_file(&temp_html, &full_html)?;
-            
-            // Convert HTML to PDF
-            convert_html_to_pdf(&temp_html, &config.output_file)?;
-            
-            // Clean up temporary file
-            let _ = fs::remove_file(temp_html);
+            convert_markdown_to_pdf(&markdown_content, &config.output_file)?;
         }
     }
-    
+
     println!("✅ Successfully converted markdown to {}!", format_str);
     println!("📁 Output file: {}", config.output_file.display());
-    
+
     Ok(())
 }
 
@@ -297,70 +374,53 @@ fn print_usage(program_name: &str) {
     println!("  • Windows: Download from https://wkhtmltopdf.org/downloads.html");
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let program_name = &args[0];
-    
-    // Handle help flag
-    if args.len() == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") {
-        print_usage(program_name);
-        return;
-    }
-    
-    // Check if we have enough arguments
-    if args.len() < 3 {
-        eprintln!("❌ Error: Insufficient arguments");
-        eprintln!();
-        print_usage(program_name);
-        process::exit(1);
-    }
-    
-    // Parse command
-    match args[1].as_str() {
-        "convert" => {
-            let input_file = &args[2];
-            let output_file = args.get(3).map(|s| s.as_str());
-            
-            // Create configuration
-            let config = match Config::new(input_file, output_file, OutputFormat::Html) {
-                Ok(config) => config,
-                Err(e) => {
-                    eprintln!("❌ Configuration error: {}", e);
-                    process::exit(1);
-                }
-            };
-            
-            // Convert the file
-            if let Err(e) = convert_markdown_file(&config) {
-                eprintln!("❌ Conversion failed: {}", e);
-                process::exit(1);
-            }
-        }
-        "pdf" => {
-            let input_file = &args[2];
-            let output_file = args.get(3).map(|s| s.as_str());
-            
-            // Create configuration
-            let config = match Config::new(input_file, output_file, OutputFormat::Pdf) {
-                Ok(config) => config,
-                Err(e) => {
-                    eprintln!("❌ Configuration error: {}", e);
-                    process::exit(1);
-                }
-            };
-            
-            // Convert the file
-            if let Err(e) = convert_markdown_file(&config) {
-                eprintln!("❌ Conversion failed: {}", e);
-                process::exit(1);
-            }
-        }
+fn handle_command(
+    command: &str,
+    input_file: &str,
+    output_file: Option<&str>,
+    program_name: &str,
+) -> Result<(), ConversionError> {
+    let format = match command {
+        "convert" => OutputFormat::Html,
+        "pdf" => OutputFormat::Pdf,
         _ => {
-            eprintln!("❌ Unknown command: '{}'", args[1]);
-            eprintln!("Available commands: convert, pdf");
-            eprintln!();
+            eprintln!("❌ Unknown command: '{}'", command);
             print_usage(program_name);
             process::exit(1);
         }
+    };
+
+    let config = Config::new(input_file, output_file, format)
+        .map_err(|e| {
+            eprintln!("❌ Configuration error: {}", e);
+            process::exit(1);
+        })
+        .unwrap();
+
+    convert_markdown_file(&config)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let program_name = &args[0];
+
+    if args.len() == 2 && ["-h", "--help", "help"].contains(&args[1].as_str()) {
+        print_usage(program_name);
+        return;
+    }
+
+    if args.len() < 3 {
+        eprintln!("❌ Error: Insufficient arguments\n");
+        print_usage(program_name);
+        process::exit(1);
+    }
+
+    let command = &args[1];
+    let input_file = &args[2];
+    let output_file = args.get(3).map(|s| s.as_str());
+
+    if let Err(e) = handle_command(command, input_file, output_file, program_name) {
+        eprintln!("❌ Conversion failed: {}", e);
+        process::exit(1);
     }
 }
