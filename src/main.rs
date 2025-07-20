@@ -6,7 +6,6 @@ use std::process::{self, Command};
 
 use comrak::{markdown_to_html, ComrakOptions, ComrakExtensionOptions};
 use reqwest;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 use tokio;
