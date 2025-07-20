@@ -1,5 +1,17 @@
 {
+  "name": "Rust Dev Container",
   "image": "mcr.microsoft.com/devcontainers/universal:2",
-  "features": {}
-  "ghcr.io/devcontainers/features/rust:1": {}
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {}
+  },
+  "postCreateCommand": "rustup update && cargo --version && rustc --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  },
+  "remoteUser": "vscode"
 }
