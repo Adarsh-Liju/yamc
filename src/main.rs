@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use comrak::{markdown_to_html, ComrakOptions, ComrakExtensionOptions};
-use printpdf::*;
-use std::io::BufWriter;
+use reqwest;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tempfile::NamedTempFile;
+use tokio;
 
 #[derive(Debug)]
 enum OutputFormat {
@@ -60,18 +63,18 @@ impl Config {
 #[derive(Debug)]
 enum ConversionError {
     IoError(io::Error),
-    InvalidInput(String),
-    ConversionFailed(String),
     PdfConversionFailed(String),
+    ChromeError(String),
+    NetworkError(String),
 }
 
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConversionError::IoError(e) => write!(f, "I/O error: {}", e),
-            ConversionError::InvalidInput(e) => write!(f, "Invalid input: {}", e),
-            ConversionError::ConversionFailed(e) => write!(f, "Conversion failed: {}", e),
             ConversionError::PdfConversionFailed(e) => write!(f, "PDF conversion failed: {}", e),
+            ConversionError::ChromeError(e) => write!(f, "Chrome error: {}", e),
+            ConversionError::NetworkError(e) => write!(f, "Network error: {}", e),
         }
     }
 }
@@ -81,6 +84,12 @@ impl std::error::Error for ConversionError {}
 impl From<io::Error> for ConversionError {
     fn from(err: io::Error) -> Self {
         ConversionError::IoError(err)
+    }
+}
+
+impl From<reqwest::Error> for ConversionError {
+    fn from(err: reqwest::Error) -> Self {
+        ConversionError::NetworkError(err.to_string())
     }
 }
 
@@ -174,142 +183,157 @@ fn write_html_file(path: &Path, content: &str) -> Result<(), ConversionError> {
     Ok(())
 }
 
-fn check_wkhtmltopdf_installed() -> bool {
-    Command::new("wkhtmltopdf")
-        .arg("--version")
-        .output()
-        .is_ok()
-}
+async fn convert_html_to_pdf_with_chrome(html_file: &Path, pdf_file: &Path) -> Result<(), ConversionError> {
+    // Start headless Chrome
+    let mut chrome_process = Command::new("chrome")
+        .args(&[
+            "--headless",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--remote-debugging-port=9222",
+            "--disable-web-security",
+            "--allow-running-insecure-content"
+        ])
+        .spawn()
+        .or_else(|_| Command::new("chromium")
+            .args(&[
+                "--headless",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--remote-debugging-port=9222",
+                "--disable-web-security",
+                "--allow-running-insecure-content"
+            ])
+            .spawn())
+        .or_else(|_| Command::new("google-chrome")
+            .args(&[
+                "--headless",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--remote-debugging-port=9222",
+                "--disable-web-security",
+                "--allow-running-insecure-content"
+            ])
+            .spawn())
+        .map_err(|_| ConversionError::ChromeError(
+            "Could not start Chrome/Chromium. Please ensure Chrome or Chromium is installed.".to_string()
+        ))?;
 
-fn convert_html_to_pdf(html_file: &Path, pdf_file: &Path) -> Result<(), ConversionError> {
-    if !check_wkhtmltopdf_installed() {
-        return Err(ConversionError::PdfConversionFailed(
-            "wkhtmltopdf is not installed. Please install it first:\n\
-             Ubuntu/Debian: sudo apt-get install wkhtmltopdf\n\
-             macOS: brew install wkhtmltopdf\n\
-             Windows: Download from https://wkhtmltopdf.org/downloads.html\n\
-             \n\
-             Alternatively, you can use the 'convert' command to generate HTML first.".to_string()
-        ));
+    // Wait a moment for Chrome to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // Get the list of available targets
+    let client = reqwest::Client::new();
+    let targets_response = client.get("http://localhost:9222/json")
+        .send()
+        .await?;
+    
+    let targets: Vec<Value> = targets_response.json().await?;
+    let target = targets.into_iter()
+        .find(|t| t["type"] == "page")
+        .ok_or_else(|| ConversionError::ChromeError("No page target found".to_string()))?;
+    
+    let ws_url = target["webSocketDebuggerUrl"].as_str()
+        .ok_or_else(|| ConversionError::ChromeError("No WebSocket URL found".to_string()))?;
+
+    // Connect to the page and navigate to our HTML file
+    let file_url = format!("file://{}", html_file.to_string_lossy());
+    
+    // Use the CDP (Chrome DevTools Protocol) to navigate and print
+    let cdp_client = reqwest::Client::new();
+    
+    // Create a new tab
+    let create_tab_response = cdp_client.post("http://localhost:9222/json/new")
+        .send()
+        .await?;
+    
+    let tab_info: Value = create_tab_response.json().await?;
+    let tab_id = tab_info["id"].as_str()
+        .ok_or_else(|| ConversionError::ChromeError("Failed to get tab ID".to_string()))?;
+    
+    // Navigate to the HTML file
+    let navigate_response = cdp_client.post(&format!("http://localhost:9222/json/navigate/{}", tab_id))
+        .json(&json!({
+            "url": file_url
+        }))
+        .send()
+        .await?;
+    
+    if !navigate_response.status().is_success() {
+        return Err(ConversionError::ChromeError("Failed to navigate to HTML file".to_string()));
     }
-
-    let output = Command::new("wkhtmltopdf")
-        .arg("--enable-local-file-access")
-        .arg("--print-media-type")
-        .arg("--margin-top")
-        .arg("20mm")
-        .arg("--margin-bottom")
-        .arg("20mm")
-        .arg("--margin-left")
-        .arg("20mm")
-        .arg("--margin-right")
-        .arg("20mm")
-        .arg("--page-size")
-        .arg("A4")
-        .arg("--encoding")
-        .arg("UTF-8")
-        .arg(html_file.to_str().unwrap())
-        .arg(pdf_file.to_str().unwrap())
-        .output()
-        .map_err(|e| ConversionError::PdfConversionFailed(format!("Failed to run wkhtmltopdf: {}", e)))?;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(ConversionError::PdfConversionFailed(
-            format!("wkhtmltopdf failed: {}", error_msg)
-        ));
+    
+    // Wait for the page to load
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+    
+    // Print to PDF
+    let print_response = cdp_client.post(&format!("http://localhost:9222/json/print/{}", tab_id))
+        .json(&json!({
+            "landscape": false,
+            "displayHeaderFooter": false,
+            "printBackground": true,
+            "preferCSSPageSize": true,
+            "paperWidth": 8.27,  // A4 width in inches
+            "paperHeight": 11.69, // A4 height in inches
+            "marginTop": 0.4,
+            "marginBottom": 0.4,
+            "marginLeft": 0.4,
+            "marginRight": 0.4
+        }))
+        .send()
+        .await?;
+    
+    if !print_response.status().is_success() {
+        return Err(ConversionError::ChromeError("Failed to generate PDF".to_string()));
     }
-
+    
+    let print_result: Value = print_response.json().await?;
+    let pdf_data = print_result["data"].as_str()
+        .ok_or_else(|| ConversionError::ChromeError("No PDF data received".to_string()))?;
+    
+    // Decode base64 PDF data and write to file
+    let pdf_bytes = base64::decode(pdf_data)
+        .map_err(|e| ConversionError::PdfConversionFailed(format!("Failed to decode PDF data: {}", e)))?;
+    
+    fs::write(pdf_file, pdf_bytes)?;
+    
+    // Close the tab
+    let _ = cdp_client.post(&format!("http://localhost:9222/json/close/{}", tab_id))
+        .send()
+        .await;
+    
+    // Terminate Chrome
+    let _ = chrome_process.kill();
+    
     Ok(())
 }
 
-// Add a new function for pure Rust PDF export
 fn convert_markdown_to_pdf(markdown: &str, pdf_path: &Path) -> Result<(), ConversionError> {
-    use comrak::{parse_document, Arena, ComrakOptions, nodes::{AstNode, NodeValue}};
-    use printpdf::{PdfDocument, Mm, Pt, PdfLayerReference};
-
-    let arena = Arena::new();
-    let options = create_comrak_options();
-    let root = parse_document(&arena, markdown, &options);
-
-    let (doc, page1, layer1) = PdfDocument::new("Markdown PDF", Mm(210.0), Mm(297.0), "Layer 1");
-    let current_layer = doc.get_page(page1).get_layer(layer1);
-
-    let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
-    let mut y = Mm(287.0); // Start near top of A4
-
-    render_node_to_pdf(&root, &current_layer, &font, &mut y)?;
-
-    let mut file = BufWriter::new(fs::File::create(pdf_path)?);
-    doc.save(&mut file).map_err(|e| ConversionError::PdfConversionFailed(format!("PDF save error: {e}")))?;
-    Ok(())
-}
-
-// Recursively render AST nodes to PDF
-fn render_node_to_pdf<'a>(
-    node: &'a AstNode<'a>,
-    layer: &PdfLayerReference,
-    font: &IndirectFontRef,
-    y: &mut Mm,
-) -> Result<(), ConversionError> {
-    use comrak::nodes::NodeValue::*;
-    for child in node.children() {
-        match &child.data.borrow().value {
-            Heading(h) => {
-                let text = collect_text(child);
-                let size = match h.level {
-                    1 => 24.0,
-                    2 => 20.0,
-                    3 => 16.0,
-                    _ => 14.0,
-                };
-                *y -= Mm(size * 0.7);
-                layer.use_text(text, size, Mm(20.0), *y, font);
-                *y -= Mm(4.0);
-            }
-            Paragraph => {
-                let text = collect_text(child);
-                *y -= Mm(10.0);
-                layer.use_text(text, 12.0, Mm(20.0), *y, font);
-                *y -= Mm(4.0);
-            }
-            List(_) => {
-                for item in child.children() {
-                    if let Item = item.data.borrow().value {
-                        let text = collect_text(item);
-                        *y -= Mm(8.0);
-                        layer.use_text(format!("• {}", text), 12.0, Mm(25.0), *y, font);
-                        *y -= Mm(2.0);
-                    }
-                }
-            }
-            Text(t) => {
-                // handled in collect_text
-            }
-            Emph | Strong | Code | HtmlInline(_) | SoftBreak | LineBreak | CodeBlock(_) | ThematicBreak | BlockQuote | HtmlBlock(_) | FootnoteDefinition(_) | Table(_) | TableRow | TableCell | TaskItem { .. } | DescriptionList | DescriptionItem(_) | DescriptionTerm | DescriptionDetails => {
-                // Not implemented for brevity
-            }
-            _ => {}
-        }
-        render_node_to_pdf(child, layer, font, y)?;
-    }
-    Ok(())
-}
-
-// Helper to collect text from a node
-fn collect_text<'a>(node: &'a AstNode<'a>) -> String {
-    use comrak::nodes::NodeValue::*;
-    let mut text = String::new();
-    for child in node.children() {
-        match &child.data.borrow().value {
-            Text(t) => text.push_str(&String::from_utf8_lossy(t)),
-            Code(t) => text.push_str(&String::from_utf8_lossy(t)),
-            Emph | Strong => text.push_str(&collect_text(child)),
-            SoftBreak | LineBreak => text.push(' '),
-            _ => text.push_str(&collect_text(child)),
-        }
-    }
-    text
+    // Convert markdown to HTML first
+    let html_content = convert_markdown_to_html(markdown)?;
+    let full_html = create_html_document(&html_content, 
+        "https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/4.0.0/github-markdown.min.css", 
+        "markdown-body");
+    
+    // Create a temporary HTML file
+    let temp_html = NamedTempFile::new()
+        .map_err(|e| ConversionError::IoError(e))?
+        .into_temp_path();
+    write_html_file(&temp_html, &full_html)?;
+    
+    // Convert HTML to PDF using headless Chrome
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| ConversionError::ChromeError(format!("Failed to create async runtime: {}", e)))?;
+    
+    let result = runtime.block_on(convert_html_to_pdf_with_chrome(&temp_html, pdf_path));
+    
+    // Clean up temporary file
+    let _ = fs::remove_file(&temp_html);
+    
+    result
 }
 
 // Update convert_markdown_file to use the new PDF function
@@ -366,12 +390,13 @@ fn print_usage(program_name: &str) {
     println!("  • Responsive design");
     println!("  • HTML and PDF output formats");
     println!("  • Automatic file extension handling");
+    println!("  • Pure Rust implementation with headless Chrome");
     println!();
     println!("PDF Requirements:");
-    println!("  • wkhtmltopdf must be installed for PDF conversion");
-    println!("  • Install: sudo apt-get install wkhtmltopdf (Ubuntu/Debian)");
-    println!("  • Install: brew install wkhtmltopdf (macOS)");
-    println!("  • Windows: Download from https://wkhtmltopdf.org/downloads.html");
+    println!("  • Chrome or Chromium must be installed for PDF conversion");
+    println!("  • The tool will automatically detect and use Chrome/Chromium");
+    println!("  • Uses headless mode for PDF generation");
+    println!("  • No external dependencies like wkhtmltopdf required");
 }
 
 fn handle_command(
