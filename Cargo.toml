@@ -6,7 +6,7 @@ authors = ["Adarsh Liju Abraham"]
 license = "MIT OR Apache-2.0"
 description = "Yet Another Markdown Converter - A fast and feature-rich markdown to HTML and PDF converter"
 repository = "https://github.com/yourusername/yamc"
-keywords = ["markdown", "html", "converter", "cli", "documentation", "pdf"]
+keywords = ["markdown", "html", "converter", "cli", "pdf"]
 categories = ["command-line-utilities", "text-processing"]
 readme = "README.md"
 

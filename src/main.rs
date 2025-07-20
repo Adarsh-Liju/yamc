@@ -235,7 +235,7 @@ async fn convert_html_to_pdf_with_chrome(html_file: &Path, pdf_file: &Path) -> R
         .find(|t| t["type"] == "page")
         .ok_or_else(|| ConversionError::ChromeError("No page target found".to_string()))?;
     
-    let ws_url = target["webSocketDebuggerUrl"].as_str()
+    let _ws_url = target["webSocketDebuggerUrl"].as_str()
         .ok_or_else(|| ConversionError::ChromeError("No WebSocket URL found".to_string()))?;
 
     // Connect to the page and navigate to our HTML file
@@ -294,7 +294,8 @@ async fn convert_html_to_pdf_with_chrome(html_file: &Path, pdf_file: &Path) -> R
         .ok_or_else(|| ConversionError::ChromeError("No PDF data received".to_string()))?;
     
     // Decode base64 PDF data and write to file
-    let pdf_bytes = base64::decode(pdf_data)
+    use base64::Engine;
+    let pdf_bytes = base64::engine::general_purpose::STANDARD.decode(pdf_data)
         .map_err(|e| ConversionError::PdfConversionFailed(format!("Failed to decode PDF data: {}", e)))?;
     
     fs::write(pdf_file, pdf_bytes)?;
